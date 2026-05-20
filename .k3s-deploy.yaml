@@ -1,0 +1,24 @@
+apiVersion: platform.ptlzc.com/v1
+kind: K3sAppDeployConfig
+cluster: txyun
+project: dev-infra-broker
+environment: prod
+namespace: dev-infra-broker
+
+gitops:
+  repo: git@github.com:ptlzc/k3s-apps.git
+  path: apps/dev-infra-broker/overlays/prod
+
+image:
+  registry: ghcr.io
+  repository: ptlzc/dev-infra-broker
+
+placement:
+  profile: home-k3s-worker
+
+exposure:
+  gatewayId: tailnet-home-k3s-worker
+  hostname: dev-infra-broker.in.ptlzc.com
+  paths:
+    - /
+
