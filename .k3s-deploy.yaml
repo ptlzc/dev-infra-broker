@@ -10,7 +10,7 @@ gitops:
   path: apps/dev-infra-broker/overlays/prod
 
 image:
-  registry: ghcr.io
+  registry: registry.cn-hangzhou.aliyuncs.com
   repository: ptlzc/dev-infra-broker
 
 placement:
@@ -21,4 +21,3 @@ exposure:
   hostname: dev-infra-broker.in.ptlzc.com
   paths:
     - /
-
