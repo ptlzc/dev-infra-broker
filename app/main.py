@@ -125,6 +125,16 @@ def _patch_vault_kv2_secret(mount: str, path: str, values: dict[str, str]) -> No
         )
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail="Vault backend patch failed.") from exc
+    if response.status_code in {404, 405}:
+        try:
+            response = httpx.post(
+                url,
+                headers={"X-Vault-Token": token},
+                json={"data": values},
+                timeout=5.0,
+            )
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail="Vault backend create failed.") from exc
     if response.status_code in {401, 403}:
         raise HTTPException(status_code=503, detail="Vault backend write access is denied.")
     if response.status_code >= 400:
