@@ -1,9 +1,13 @@
+import base64
 from enum import StrEnum
 import os
+import secrets
+import string
 from typing import Annotated
 
 import httpx
 from fastapi import FastAPI, HTTPException, Path
+from nacl import encoding, public
 from pydantic import BaseModel, Field
 
 
@@ -12,7 +16,7 @@ app = FastAPI(
     version="0.1.0",
     description=(
         "Internal broker for k3s deployment automation. "
-        "Write-capable endpoints are disabled until authn/authz/audit backends are configured."
+        "Secret values remain internal and are never returned to callers."
     ),
 )
 
@@ -23,6 +27,15 @@ PLATFORM_SECRET_KEYS = [
     "REGISTRY_NAMESPACE",
     "GH_PAT",
 ]
+
+GITHUB_ACTIONS_SYNC_KEYS = [
+    "REGISTRY_USERNAME",
+    "REGISTRY_PASSWORD",
+    "REGISTRY_URL",
+    "REGISTRY_NAMESPACE",
+]
+
+SECRET_KEY_ALPHABET = string.ascii_letters + string.digits + "-_"
 
 
 def _vault_settings() -> tuple[str, str, str]:
@@ -94,6 +107,92 @@ def _read_vault_kv2_secret(mount: str, path: str) -> dict[str, object]:
     return data
 
 
+def _patch_vault_kv2_secret(mount: str, path: str, values: dict[str, str]) -> None:
+    if not values:
+        return
+    address, _, _ = _vault_settings()
+    token = _vault_token()
+    url = f"{address}/v1/{mount}/data/{path}"
+    try:
+        response = httpx.patch(
+            url,
+            headers={
+                "X-Vault-Token": token,
+                "Content-Type": "application/merge-patch+json",
+            },
+            json={"data": values},
+            timeout=5.0,
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="Vault backend patch failed.") from exc
+    if response.status_code in {401, 403}:
+        raise HTTPException(status_code=503, detail="Vault backend write access is denied.")
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail="Vault backend write returned an error.")
+
+
+def _platform_secret_source() -> dict[str, object]:
+    _, mount, path = _vault_settings()
+    data = _read_vault_kv2_secret(mount, path)
+    missing = [key for key in PLATFORM_SECRET_KEYS if key not in data or data[key] in (None, "")]
+    if missing:
+        raise HTTPException(
+            status_code=503,
+            detail={"message": "Platform secret source is incomplete.", "missing": missing},
+        )
+    return data
+
+
+def _require_platform_value(source: dict[str, object], key: str) -> str:
+    value = source.get(key)
+    if not isinstance(value, str) or not value:
+        raise HTTPException(status_code=503, detail=f"Platform secret key {key} is missing.")
+    return value
+
+
+def _generate_secret(spec: "GeneratedSecretSpec") -> str:
+    if spec.generator == Generator.RANDOM_BASE64:
+        size = spec.bytes or 32
+        return base64.b64encode(secrets.token_bytes(size)).decode("ascii")
+    if spec.generator == Generator.RANDOM_HEX:
+        size = spec.bytes or 32
+        return secrets.token_hex(size)
+    if spec.generator == Generator.RANDOM_PASSWORD:
+        length = spec.length or 32
+        return "".join(secrets.choice(SECRET_KEY_ALPHABET) for _ in range(length))
+    raise HTTPException(status_code=400, detail="Unsupported generator.")
+
+
+def _encrypt_github_secret(public_key: str, value: str) -> str:
+    key = public.PublicKey(public_key.encode("utf-8"), encoding.Base64Encoder())
+    sealed_box = public.SealedBox(key)
+    encrypted = sealed_box.encrypt(value.encode("utf-8"))
+    return base64.b64encode(encrypted).decode("ascii")
+
+
+def _github_request(
+    method: str,
+    url: str,
+    token: str,
+    *,
+    json_body: dict[str, object] | None = None,
+) -> httpx.Response:
+    try:
+        return httpx.request(
+            method,
+            url,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {token}",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            json=json_body,
+            timeout=10.0,
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="GitHub API request failed.") from exc
+
+
 class Generator(StrEnum):
     RANDOM_BASE64 = "random-base64"
     RANDOM_HEX = "random-hex"
@@ -152,14 +251,15 @@ def healthz() -> dict[str, str]:
 def capabilities() -> dict[str, object]:
     return {
         "service": "dev-infra-broker",
-        "mode": "skeleton-disabled-writes",
+        "mode": "vault-backed-writes-enabled",
         "runtimeSecretSets": {
-            "enabled": False,
+            "enabled": True,
             "generators": [item.value for item in Generator],
             "returnsSecretValues": False,
         },
         "githubActionsSecrets": {
-            "enabled": False,
+            "enabled": True,
+            "allowedKeys": GITHUB_ACTIONS_SYNC_KEYS,
             "returnsSecretValues": False,
         },
         "platformSecretSource": {
@@ -174,7 +274,8 @@ def capabilities() -> dict[str, object]:
         "rules": [
             "Broker clients never receive Vault paths or Vault tokens.",
             "Broker responses never include secret values.",
-            "Write-capable endpoints require authn, authz, and audit before enablement.",
+            "GitHub Actions secret sync never exports GH_PAT to target repositories.",
+            "Runtime generated secrets are generated only when absent to avoid unintended rotation.",
         ],
     }
 
@@ -203,9 +304,35 @@ def platform_secret_status() -> PlatformSecretStatusResponse:
     tags=["runtime-secrets"],
 )
 def ensure_runtime_secret_set(_: RuntimeSecretEnsureRequest) -> RuntimeSecretEnsureResponse:
-    raise HTTPException(
-        status_code=501,
-        detail="Runtime secret writes are disabled until authn/authz/audit backends are configured.",
+    request = _
+    _, mount, _ = _vault_settings()
+    path = f"projects/{request.namespace}/{request.serviceAccountName}/env"
+    existing = _read_vault_kv2_secret(mount, path)
+
+    generated_written: list[str] = []
+    generated_values: dict[str, str] = {}
+    for key, spec in request.generated.items():
+        if not key.replace("_", "").isalnum() or not key or key[0].isdigit():
+            raise HTTPException(status_code=400, detail=f"Invalid generated secret key: {key}")
+        if key in existing and existing[key] not in (None, ""):
+            continue
+        generated_values[key] = _generate_secret(spec)
+        generated_written.append(key)
+
+    _patch_vault_kv2_secret(mount, path, generated_values)
+
+    after = {**existing, **generated_values}
+    required_present = [
+        key for key in request.requiredExisting if key in after and after[key] not in (None, "")
+    ]
+    required_missing = [key for key in request.requiredExisting if key not in required_present]
+
+    return RuntimeSecretEnsureResponse(
+        ok=not required_missing,
+        destinationSecretName=request.destinationSecretName,
+        generatedWritten=generated_written,
+        requiredExistingPresent=required_present,
+        requiredExistingMissing=required_missing,
     )
 
 
@@ -219,8 +346,67 @@ def sync_github_actions_secrets(
     repo: Annotated[str, Path(pattern=r"^[A-Za-z0-9_.-]+$")],
     _: GitHubActionsSecretSyncRequest,
 ) -> GitHubActionsSecretSyncResponse:
-    _ = f"{owner}/{repo}"
-    raise HTTPException(
-        status_code=501,
-        detail="GitHub Actions secret sync is disabled until authn/authz/audit backends are configured.",
+    request = _
+    requested = list(dict.fromkeys(request.keys))
+    unsupported = [key for key in requested if key not in GITHUB_ACTIONS_SYNC_KEYS]
+    if unsupported:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Unsupported GitHub Actions secret keys.",
+                "unsupported": unsupported,
+                "allowed": GITHUB_ACTIONS_SYNC_KEYS,
+            },
+        )
+
+    source = _platform_secret_source()
+    missing = [key for key in requested if key not in source or source[key] in (None, "")]
+    if missing:
+        return GitHubActionsSecretSyncResponse(
+            ok=False,
+            repository=f"{owner}/{repo}",
+            synced=[],
+            missing=missing,
+        )
+
+    github_token = _require_platform_value(source, "GH_PAT")
+    public_key_response = _github_request(
+        "GET",
+        f"https://api.github.com/repos/{owner}/{repo}/actions/secrets/public-key",
+        github_token,
+    )
+    if public_key_response.status_code == 404:
+        raise HTTPException(status_code=404, detail="GitHub repository was not found or is inaccessible.")
+    if public_key_response.status_code in {401, 403}:
+        raise HTTPException(status_code=503, detail="GitHub token cannot manage repository secrets.")
+    if public_key_response.status_code >= 400:
+        raise HTTPException(status_code=502, detail="GitHub public key request failed.")
+
+    key_payload = public_key_response.json()
+    public_key = key_payload.get("key")
+    key_id = key_payload.get("key_id")
+    if not isinstance(public_key, str) or not isinstance(key_id, str):
+        raise HTTPException(status_code=502, detail="GitHub public key response was invalid.")
+
+    synced: list[str] = []
+    for key in requested:
+        value = _require_platform_value(source, key)
+        encrypted_value = _encrypt_github_secret(public_key, value)
+        put_response = _github_request(
+            "PUT",
+            f"https://api.github.com/repos/{owner}/{repo}/actions/secrets/{key}",
+            github_token,
+            json_body={"encrypted_value": encrypted_value, "key_id": key_id},
+        )
+        if put_response.status_code not in {201, 204}:
+            if put_response.status_code in {401, 403}:
+                raise HTTPException(status_code=503, detail="GitHub token cannot write repository secrets.")
+            raise HTTPException(status_code=502, detail=f"GitHub secret sync failed for {key}.")
+        synced.append(key)
+
+    return GitHubActionsSecretSyncResponse(
+        ok=True,
+        repository=f"{owner}/{repo}",
+        synced=synced,
+        missing=[],
     )

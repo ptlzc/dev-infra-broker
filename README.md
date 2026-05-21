@@ -8,8 +8,8 @@ This version is intentionally conservative:
 - exposes `/v1/capabilities`
 - exposes OpenAPI through FastAPI at `/openapi.json`
 - exposes `/v1/platform/secrets/status` to report whether required platform secret keys exist
-- defines runtime secret and GitHub Actions secret sync endpoints
-- returns `501` for write-capable endpoints until authentication, authorization, auditing, and backend credentials are implemented
+- syncs approved platform keys into GitHub Actions Repository secrets
+- ensures generated runtime bootstrap secrets in Vault without returning secret values
 
 The service must never return secret values. Runtime Vault paths, Vault tokens, GitHub credentials, and generated secret values are platform-internal implementation details.
 
@@ -40,6 +40,68 @@ Runtime Vault configuration:
 - `VAULT_K8S_ROLE`, default `dev-infra-broker-platform-reader`
 
 Do not configure long-lived Vault tokens in GitOps. In-cluster runtime should use Vault Kubernetes Auth with the broker ServiceAccount.
+
+## GitHub Actions Secret Sync
+
+Endpoint:
+
+```text
+POST /v1/github/repositories/{owner}/{repo}/actions-secrets/sync
+```
+
+Allowed target keys:
+
+- `REGISTRY_USERNAME`
+- `REGISTRY_PASSWORD`
+- `REGISTRY_URL`
+- `REGISTRY_NAMESPACE`
+
+`GH_PAT` is used only by the broker to call GitHub's repository secrets API. It is never synced into a target repository.
+
+Example request:
+
+```json
+{
+  "cluster": "txyun",
+  "secretSet": "platform",
+  "keys": ["REGISTRY_USERNAME", "REGISTRY_PASSWORD"]
+}
+```
+
+The response contains only key names.
+
+## Runtime Secret Ensure
+
+Endpoint:
+
+```text
+POST /v1/runtime-secret-sets/ensure
+```
+
+The broker reads the existing Vault KV path, generates only missing generated keys, writes by KV v2 merge patch, and returns only key names.
+
+Path convention:
+
+```text
+k3s-kv/projects/<namespace>/<serviceAccountName>/env
+```
+
+Example request:
+
+```json
+{
+  "cluster": "txyun",
+  "namespace": "example-api",
+  "serviceAccountName": "example-api",
+  "destinationSecretName": "example-api-env",
+  "generated": {
+    "SESSION_SECRET": {"generator": "random-base64", "bytes": 32}
+  },
+  "requiredExisting": ["OPENAI_API_KEY"]
+}
+```
+
+Generated keys are idempotent: existing non-empty values are not overwritten, so a normal deploy does not rotate secrets.
 
 ## Local Run
 
