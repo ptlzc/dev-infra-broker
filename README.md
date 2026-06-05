@@ -8,6 +8,7 @@ This version is intentionally conservative:
 - exposes `/v1/capabilities`
 - exposes OpenAPI through FastAPI at `/openapi.json`
 - exposes `/v1/platform/secrets/status` to report whether required platform secret keys exist
+- exposes `/v1/kubernetes/namespaces/{namespace}/pods/{pod}/logs` for bounded, redacted pod log snapshots in non-system application namespaces
 - syncs approved platform keys into GitHub Actions Repository secrets
 - ensures generated runtime bootstrap secrets in Vault without returning secret values
 
@@ -69,6 +70,25 @@ Example request:
 ```
 
 The response contains only key names.
+
+## Pod Log Query
+
+Endpoint:
+
+```text
+GET /v1/kubernetes/namespaces/{namespace}/pods/{pod}/logs
+```
+
+Supported query parameters:
+
+- `container`
+- `previous`
+- `tailLines`
+- `sinceSeconds`
+- `limitBytes`
+- `timestamps`
+
+The broker returns a bounded snapshot only. Log queries are limited to non-system application namespaces, are redacted with best-effort pattern masking, and do not support streaming follow mode.
 
 ## Runtime Secret Ensure
 

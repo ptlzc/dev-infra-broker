@@ -1,12 +1,13 @@
 import base64
 from enum import StrEnum
 import os
+import re
 import secrets
 import string
 from typing import Annotated
 
 import httpx
-from fastapi import FastAPI, HTTPException, Path
+from fastapi import FastAPI, HTTPException, Path, Query
 from nacl import encoding, public
 from pydantic import BaseModel, Field
 
@@ -36,6 +37,35 @@ GITHUB_ACTIONS_SYNC_KEYS = [
 ]
 
 SECRET_KEY_ALPHABET = string.ascii_letters + string.digits + "-_"
+LOG_QUERY_DENIED_NAMESPACE_PREFIXES = tuple(
+    prefix.strip()
+    for prefix in os.getenv(
+        "LOG_QUERY_DENIED_NAMESPACE_PREFIXES",
+        "kube-,argocd,edge-system,cert-manager,traefik-,vault-secrets-operator-system,default,platform-app-deploy",
+    ).split(",")
+    if prefix.strip()
+)
+LOG_QUERY_DEFAULT_TAIL_LINES = int(os.getenv("LOG_QUERY_DEFAULT_TAIL_LINES", "200"))
+LOG_QUERY_MAX_TAIL_LINES = int(os.getenv("LOG_QUERY_MAX_TAIL_LINES", "2000"))
+LOG_QUERY_DEFAULT_LIMIT_BYTES = int(os.getenv("LOG_QUERY_DEFAULT_LIMIT_BYTES", "262144"))
+LOG_QUERY_MAX_LIMIT_BYTES = int(os.getenv("LOG_QUERY_MAX_LIMIT_BYTES", "1048576"))
+LOG_REDACTION_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(r"(?is)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----"),
+        "[REDACTED_PRIVATE_KEY_BLOCK]",
+    ),
+    (
+        re.compile(r"(?i)\b(authorization\s*:\s*bearer\s+)[^\s]+"),
+        r"\1[REDACTED]",
+    ),
+    (
+        re.compile(r"(?i)\b(password|passwd|secret|token|api[_-]?key)\s*[:=]\s*([^\s'\"`]+)"),
+        r"\1=[REDACTED]",
+    ),
+    (re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"), "[REDACTED_GITHUB_TOKEN]"),
+    (re.compile(r"\bxox[baprs]-[A-Za-z0-9-]+\b"), "[REDACTED_SLACK_TOKEN]"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[REDACTED_AWS_ACCESS_KEY]"),
+)
 
 
 def _vault_settings() -> tuple[str, str, str]:
@@ -160,6 +190,84 @@ def _require_platform_value(source: dict[str, object], key: str) -> str:
     return value
 
 
+def _kubernetes_settings() -> tuple[str, str, str]:
+    host = os.getenv("KUBERNETES_SERVICE_HOST", "kubernetes.default.svc").strip()
+    port = os.getenv("KUBERNETES_SERVICE_PORT", "443").strip()
+    token_path = os.getenv(
+        "KUBERNETES_SERVICE_ACCOUNT_TOKEN_PATH",
+        "/var/run/secrets/kubernetes.io/serviceaccount/token",
+    )
+    ca_path = os.getenv(
+        "KUBERNETES_SERVICE_ACCOUNT_CA_PATH",
+        "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+    )
+    if not host or not port:
+        raise HTTPException(status_code=503, detail="Kubernetes backend is not configured for dev-infra-broker.")
+    return f"https://{host}:{port}", token_path, ca_path
+
+
+def _kubernetes_token(token_path: str) -> str:
+    try:
+        with open(token_path, encoding="utf-8") as token_file:
+            token = token_file.read().strip()
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail="Kubernetes service account token is unavailable.") from exc
+    if not token:
+        raise HTTPException(status_code=503, detail="Kubernetes service account token is empty.")
+    return token
+
+
+def _kubernetes_request(method: str, path: str, *, params: dict[str, object] | None = None) -> httpx.Response:
+    base_url, token_path, ca_path = _kubernetes_settings()
+    try:
+        return httpx.request(
+            method,
+            f"{base_url}{path}",
+            headers={"Authorization": f"Bearer {_kubernetes_token(token_path)}"},
+            params=params,
+            verify=ca_path,
+            timeout=10.0,
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="Kubernetes API request failed.") from exc
+
+
+def _namespace_allowed_for_log_query(namespace: str) -> bool:
+    return not any(namespace == prefix or namespace.startswith(prefix) for prefix in LOG_QUERY_DENIED_NAMESPACE_PREFIXES)
+
+
+def _redact_log_text(text: str) -> tuple[str, bool]:
+    redacted = False
+    for pattern, replacement in LOG_REDACTION_RULES:
+        text, count = pattern.subn(replacement, text)
+        redacted = redacted or count > 0
+    return text, redacted
+
+
+def _log_query_params(
+    *,
+    container: str | None,
+    previous: bool,
+    tailLines: int | None,
+    sinceSeconds: int | None,
+    limitBytes: int | None,
+    timestamps: bool,
+) -> dict[str, object]:
+    params: dict[str, object] = {
+        "previous": str(previous).lower(),
+        "timestamps": str(timestamps).lower(),
+    }
+    if container:
+        params["container"] = container
+    if tailLines is not None:
+        params["tailLines"] = tailLines
+    if sinceSeconds is not None:
+        params["sinceSeconds"] = sinceSeconds
+    if limitBytes is not None:
+        params["limitBytes"] = limitBytes
+    return params
+
+
 def _generate_secret(spec: "GeneratedSecretSpec") -> str:
     if spec.generator == Generator.RANDOM_BASE64:
         size = spec.bytes or 32
@@ -252,6 +360,21 @@ class PlatformSecretStatusResponse(BaseModel):
     missing: list[str]
 
 
+class PodLogsResponse(BaseModel):
+    ok: bool
+    namespace: str
+    pod: str
+    container: str | None
+    previous: bool
+    tailLines: int | None
+    sinceSeconds: int | None
+    limitBytes: int | None
+    timestamps: bool
+    redacted: bool
+    truncated: bool
+    logs: str
+
+
 @app.get("/healthz", tags=["system"])
 def healthz() -> dict[str, str]:
     return {"status": "ok"}
@@ -271,6 +394,25 @@ def capabilities() -> dict[str, object]:
             "enabled": True,
             "allowedKeys": GITHUB_ACTIONS_SYNC_KEYS,
             "returnsSecretValues": False,
+        },
+        "podLogs": {
+            "enabled": True,
+            "endpointPattern": "GET /v1/kubernetes/namespaces/<namespace>/pods/<pod>/logs",
+            "namespacePolicy": {
+                "mode": "non-system-namespaces-only",
+                "deniedPrefixes": list(LOG_QUERY_DENIED_NAMESPACE_PREFIXES),
+            },
+            "limits": {
+                "defaultTailLines": LOG_QUERY_DEFAULT_TAIL_LINES,
+                "maxTailLines": LOG_QUERY_MAX_TAIL_LINES,
+                "defaultLimitBytes": LOG_QUERY_DEFAULT_LIMIT_BYTES,
+                "maxLimitBytes": LOG_QUERY_MAX_LIMIT_BYTES,
+                "follow": False,
+            },
+            "redaction": {
+                "enabled": True,
+                "mode": "best-effort-pattern-redaction",
+            },
         },
         "platformSecretSource": {
             "enabled": bool(os.getenv("VAULT_ADDR")),
@@ -305,6 +447,63 @@ def platform_secret_status() -> PlatformSecretStatusResponse:
         path=f"{mount}/{path}",
         present=present,
         missing=missing,
+    )
+
+
+@app.get(
+    "/v1/kubernetes/namespaces/{namespace}/pods/{pod}/logs",
+    response_model=PodLogsResponse,
+    tags=["kubernetes", "logs"],
+)
+def get_pod_logs(
+    namespace: Annotated[str, Path(pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")],
+    pod: Annotated[str, Path(pattern=r"^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$")],
+    container: str | None = Query(default=None, pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"),
+    previous: bool = Query(default=False),
+    tailLines: int | None = Query(default=LOG_QUERY_DEFAULT_TAIL_LINES, ge=1, le=LOG_QUERY_MAX_TAIL_LINES),
+    sinceSeconds: int | None = Query(default=None, ge=1, le=86400),
+    limitBytes: int | None = Query(default=LOG_QUERY_DEFAULT_LIMIT_BYTES, ge=1, le=LOG_QUERY_MAX_LIMIT_BYTES),
+    timestamps: bool = Query(default=False),
+) -> PodLogsResponse:
+    if not _namespace_allowed_for_log_query(namespace):
+        raise HTTPException(
+            status_code=403,
+            detail="Log queries are limited to non-system application namespaces.",
+        )
+
+    params = _log_query_params(
+        container=container,
+        previous=previous,
+        tailLines=tailLines,
+        sinceSeconds=sinceSeconds,
+        limitBytes=limitBytes,
+        timestamps=timestamps,
+    )
+    response = _kubernetes_request("GET", f"/api/v1/namespaces/{namespace}/pods/{pod}/log", params=params)
+    if response.status_code == 404:
+        raise HTTPException(status_code=404, detail="Pod logs were not found.")
+    if response.status_code in {401, 403}:
+        raise HTTPException(status_code=503, detail="Kubernetes log access is denied.")
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail="Kubernetes log query failed.")
+
+    logs = response.text
+    logs, redacted = _redact_log_text(logs)
+    encoded_length = len(logs.encode("utf-8"))
+    truncated = bool(limitBytes and encoded_length >= limitBytes)
+    return PodLogsResponse(
+        ok=True,
+        namespace=namespace,
+        pod=pod,
+        container=container,
+        previous=previous,
+        tailLines=tailLines,
+        sinceSeconds=sinceSeconds,
+        limitBytes=limitBytes,
+        timestamps=timestamps,
+        redacted=redacted,
+        truncated=truncated,
+        logs=logs,
     )
 
 
