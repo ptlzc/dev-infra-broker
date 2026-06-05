@@ -1,4 +1,5 @@
 import base64
+import glob
 from enum import StrEnum
 import os
 import re
@@ -268,6 +269,112 @@ def _log_query_params(
     return params
 
 
+def _rotation_index(path: str) -> int:
+    name = os.path.basename(path)
+    number = name.split(".", 1)[0]
+    try:
+        return int(number)
+    except ValueError:
+        return 0
+
+
+def _local_pod_log_files(namespace: str, pod: str, container: str | None, previous: bool) -> list[str]:
+    root = os.getenv("LOG_QUERY_LOCAL_ROOT", "/host/var/log/pods").rstrip("/")
+    pod_dirs = [path for path in glob.glob(os.path.join(root, f"{namespace}_{pod}_*")) if os.path.isdir(path)]
+    if not pod_dirs:
+        return []
+
+    pod_dir = max(pod_dirs, key=os.path.getmtime)
+    if container:
+        container_dirs = [os.path.join(pod_dir, container)] if os.path.isdir(os.path.join(pod_dir, container)) else []
+    else:
+        container_dirs = [path for path in glob.glob(os.path.join(pod_dir, "*")) if os.path.isdir(path)]
+        if len(container_dirs) > 1:
+            raise HTTPException(
+                status_code=400,
+                detail="Container is required when the pod has more than one container.",
+            )
+
+    files: list[str] = []
+    for container_dir in container_dirs:
+        logs = [path for path in glob.glob(os.path.join(container_dir, "*.log")) if os.path.isfile(path)]
+        if previous:
+            logs = [path for path in logs if _rotation_index(path) > 0] or logs
+        else:
+            logs = [path for path in logs if _rotation_index(path) == 0] or logs
+        files.extend(sorted(logs, key=_rotation_index, reverse=previous))
+    return files
+
+
+def _read_local_pod_logs(namespace: str, pod: str, container: str | None, previous: bool) -> str:
+    files = _local_pod_log_files(namespace, pod, container, previous)
+    if not files:
+        raise FileNotFoundError
+
+    chunks: list[str] = []
+    for path in sorted(files, key=lambda item: (_rotation_index(item), item)):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as handle:
+                content = handle.read()
+        except OSError as exc:
+            raise HTTPException(status_code=502, detail="Local pod log read failed.") from exc
+        if content:
+            chunks.append(content.rstrip("\n"))
+    return "\n".join(chunks)
+
+
+def _finalize_log_text(
+    text: str,
+    *,
+    tail_lines: int | None,
+    limit_bytes: int | None,
+) -> tuple[str, bool, bool]:
+    redacted_text, redacted = _redact_log_text(text)
+    truncated = False
+
+    if tail_lines is not None:
+        lines = redacted_text.splitlines(keepends=True)
+        if len(lines) > tail_lines:
+            redacted_text = "".join(lines[-tail_lines:])
+            truncated = True
+
+    if limit_bytes is not None:
+        encoded = redacted_text.encode("utf-8")
+        if len(encoded) > limit_bytes:
+            redacted_text = encoded[:limit_bytes].decode("utf-8", errors="ignore")
+            truncated = True
+
+    return redacted_text, redacted, truncated
+
+
+def _read_kubernetes_pod_logs(
+    namespace: str,
+    pod: str,
+    container: str | None,
+    previous: bool,
+    tail_lines: int | None,
+    since_seconds: int | None,
+    limit_bytes: int | None,
+    timestamps: bool,
+) -> str:
+    params = _log_query_params(
+        container=container,
+        previous=previous,
+        tailLines=tail_lines,
+        sinceSeconds=since_seconds,
+        limitBytes=limit_bytes,
+        timestamps=timestamps,
+    )
+    response = _kubernetes_request("GET", f"/api/v1/namespaces/{namespace}/pods/{pod}/log", params=params)
+    if response.status_code == 404:
+        raise HTTPException(status_code=404, detail="Pod logs were not found.")
+    if response.status_code in {401, 403}:
+        raise HTTPException(status_code=503, detail="Kubernetes log access is denied.")
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail="Kubernetes log query failed.")
+    return response.text
+
+
 def _generate_secret(spec: "GeneratedSecretSpec") -> str:
     if spec.generator == Generator.RANDOM_BASE64:
         size = spec.bytes or 32
@@ -362,6 +469,7 @@ class PlatformSecretStatusResponse(BaseModel):
 
 class PodLogsResponse(BaseModel):
     ok: bool
+    source: str
     namespace: str
     pod: str
     container: str | None
@@ -471,28 +579,29 @@ def get_pod_logs(
             detail="Log queries are limited to non-system application namespaces.",
         )
 
-    params = _log_query_params(
-        container=container,
-        previous=previous,
-        tailLines=tailLines,
-        sinceSeconds=sinceSeconds,
-        limitBytes=limitBytes,
-        timestamps=timestamps,
-    )
-    response = _kubernetes_request("GET", f"/api/v1/namespaces/{namespace}/pods/{pod}/log", params=params)
-    if response.status_code == 404:
-        raise HTTPException(status_code=404, detail="Pod logs were not found.")
-    if response.status_code in {401, 403}:
-        raise HTTPException(status_code=503, detail="Kubernetes log access is denied.")
-    if response.status_code >= 400:
-        raise HTTPException(status_code=502, detail="Kubernetes log query failed.")
+    source = "kubernetes-api"
+    try:
+        logs = _read_kubernetes_pod_logs(
+            namespace,
+            pod,
+            container,
+            previous,
+            tailLines,
+            sinceSeconds,
+            limitBytes,
+            timestamps,
+        )
+    except HTTPException as kubernetes_error:
+        try:
+            logs = _read_local_pod_logs(namespace, pod, container, previous)
+            source = "local-node-log-file"
+        except FileNotFoundError:
+            raise kubernetes_error
 
-    logs = response.text
-    logs, redacted = _redact_log_text(logs)
-    encoded_length = len(logs.encode("utf-8"))
-    truncated = bool(limitBytes and encoded_length >= limitBytes)
+    logs, redacted, truncated = _finalize_log_text(logs, tail_lines=tailLines, limit_bytes=limitBytes)
     return PodLogsResponse(
         ok=True,
+        source=source,
         namespace=namespace,
         pod=pod,
         container=container,
