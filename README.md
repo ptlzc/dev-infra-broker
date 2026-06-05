@@ -8,7 +8,7 @@ This version is intentionally conservative:
 - exposes `/v1/capabilities`
 - exposes OpenAPI through FastAPI at `/openapi.json`
 - exposes `/v1/platform/secrets/status` to report whether required platform secret keys exist
-- exposes `/v1/kubernetes/namespaces/{namespace}/pods/{pod}/logs` for bounded, redacted pod log snapshots in non-system application namespaces
+- exposes Kubernetes pod discovery, workload status, events, ArgoCD application status, and bounded redacted pod log snapshots for non-system application namespaces
 - syncs approved platform keys into GitHub Actions Repository secrets
 - ensures generated runtime bootstrap secrets in Vault without returning secret values
 
@@ -71,7 +71,60 @@ Example request:
 
 The response contains only key names.
 
-## Pod Log Query
+## Kubernetes Diagnostics
+
+All namespace-scoped Kubernetes diagnostics are limited to non-system application namespaces. The broker returns summarized status only and never returns Kubernetes Secret values.
+
+### Pod Discovery
+
+Endpoint:
+
+```text
+GET /v1/kubernetes/namespaces/{namespace}/pods
+```
+
+Supported query parameters:
+
+- `labelSelector`
+- `fieldSelector`
+- `phase`
+
+Each returned pod includes `podName`, `phase`, `restartCount`, `nodeName`, `ownerReferences`, `containerStatuses`, `initContainerStatuses`, timestamps, and labels.
+
+Deployment pod shortcut:
+
+```text
+GET /v1/kubernetes/namespaces/{namespace}/deployments/{name}/pods
+```
+
+### Workload Status
+
+Endpoints:
+
+```text
+GET /v1/kubernetes/namespaces/{namespace}/deployments/{name}
+GET /v1/kubernetes/namespaces/{namespace}/statefulsets/{name}
+```
+
+Responses include desired, ready, available, updated, and current replica counts, `observedGeneration`, conditions, and related events.
+
+### Events
+
+Endpoint:
+
+```text
+GET /v1/kubernetes/namespaces/{namespace}/events
+```
+
+Supported query parameters:
+
+- `involvedObjectKind`
+- `involvedObjectName`
+- `involvedObjectUid`
+
+Use this for scheduler, image pull, and restart-loop diagnosis.
+
+### Pod Log Query
 
 Endpoint:
 
@@ -88,7 +141,24 @@ Supported query parameters:
 - `limitBytes`
 - `timestamps`
 
-The broker returns a bounded snapshot only. Log queries are limited to non-system application namespaces, are redacted with best-effort pattern masking, and do not support streaming follow mode.
+Additional endpoints can resolve the latest pod before reading logs:
+
+```text
+GET /v1/kubernetes/namespaces/{namespace}/deployments/{name}/logs
+GET /v1/kubernetes/namespaces/{namespace}/pods/logs?labelSelector={selector}
+```
+
+These responses include `resolvedPodName` and a `selection` object showing how the pod was selected. The broker returns a bounded snapshot only. Log queries are redacted with best-effort pattern masking and do not support streaming follow mode.
+
+## ArgoCD Application Status
+
+Endpoint:
+
+```text
+GET /v1/argocd/applications/{name}
+```
+
+Responses include `sync`, `health`, `operationState`, and `revision` from the ArgoCD `Application` status.
 
 ## Runtime Secret Ensure
 

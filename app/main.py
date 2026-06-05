@@ -5,7 +5,7 @@ import os
 import re
 import secrets
 import string
-from typing import Annotated
+from typing import Annotated, Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Path, Query
@@ -50,6 +50,7 @@ LOG_QUERY_DEFAULT_TAIL_LINES = int(os.getenv("LOG_QUERY_DEFAULT_TAIL_LINES", "20
 LOG_QUERY_MAX_TAIL_LINES = int(os.getenv("LOG_QUERY_MAX_TAIL_LINES", "2000"))
 LOG_QUERY_DEFAULT_LIMIT_BYTES = int(os.getenv("LOG_QUERY_DEFAULT_LIMIT_BYTES", "262144"))
 LOG_QUERY_MAX_LIMIT_BYTES = int(os.getenv("LOG_QUERY_MAX_LIMIT_BYTES", "1048576"))
+ARGOCD_APPLICATION_NAMESPACE = os.getenv("ARGOCD_APPLICATION_NAMESPACE", "argocd")
 LOG_REDACTION_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(r"(?is)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----"),
@@ -237,6 +238,73 @@ def _namespace_allowed_for_log_query(namespace: str) -> bool:
     return not any(namespace == prefix or namespace.startswith(prefix) for prefix in LOG_QUERY_DENIED_NAMESPACE_PREFIXES)
 
 
+def _require_namespace_allowed_for_kubernetes_query(namespace: str) -> None:
+    if not _namespace_allowed_for_log_query(namespace):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": "Kubernetes queries are limited to non-system application namespaces.",
+                "namespace": namespace,
+            },
+        )
+
+
+def _response_error_body(response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+    except ValueError:
+        return response.text[:500]
+    message = payload.get("message") if isinstance(payload, dict) else None
+    if isinstance(message, str):
+        return message[:500]
+    return response.text[:500]
+
+
+def _raise_kubernetes_response_error(response: httpx.Response, action: str) -> None:
+    if response.status_code == 404:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": f"Kubernetes resource was not found while {action}.",
+                "backendStatusCode": response.status_code,
+                "backendMessage": _response_error_body(response),
+            },
+        )
+    if response.status_code in {401, 403}:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": f"Kubernetes API access was denied while {action}.",
+                "backendStatusCode": response.status_code,
+                "backendMessage": _response_error_body(response),
+            },
+        )
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": f"Kubernetes API returned an error while {action}.",
+                "backendStatusCode": response.status_code,
+                "backendMessage": _response_error_body(response),
+            },
+        )
+
+
+def _kubernetes_json_request(method: str, path: str, *, params: dict[str, object] | None = None, action: str) -> dict[str, Any]:
+    response = _kubernetes_request(method, path, params=params)
+    _raise_kubernetes_response_error(response, action)
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={"message": f"Kubernetes API returned invalid JSON while {action}."},
+        ) from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail={"message": f"Kubernetes API returned an invalid payload while {action}."})
+    return payload
+
+
 def _redact_log_text(text: str) -> tuple[str, bool]:
     redacted = False
     for pattern, replacement in LOG_REDACTION_RULES:
@@ -366,13 +434,264 @@ def _read_kubernetes_pod_logs(
         timestamps=timestamps,
     )
     response = _kubernetes_request("GET", f"/api/v1/namespaces/{namespace}/pods/{pod}/log", params=params)
-    if response.status_code == 404:
-        raise HTTPException(status_code=404, detail="Pod logs were not found.")
-    if response.status_code in {401, 403}:
-        raise HTTPException(status_code=503, detail="Kubernetes log access is denied.")
-    if response.status_code >= 400:
-        raise HTTPException(status_code=502, detail="Kubernetes log query failed.")
+    _raise_kubernetes_response_error(response, "querying pod logs")
     return response.text
+
+
+def _restart_count(container_statuses: list[dict[str, Any]]) -> int:
+    return sum(status.get("restartCount", 0) for status in container_statuses if isinstance(status.get("restartCount", 0), int))
+
+
+def _list_or_empty(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _dict_or_empty(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _container_status_summary(status: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "name": status.get("name"),
+        "ready": status.get("ready"),
+        "restartCount": status.get("restartCount"),
+        "state": status.get("state"),
+        "lastState": status.get("lastState"),
+        "image": status.get("image"),
+        "started": status.get("started"),
+    }
+
+
+def _pod_summary(item: dict[str, Any]) -> dict[str, Any]:
+    metadata = _dict_or_empty(item.get("metadata"))
+    status = _dict_or_empty(item.get("status"))
+    spec = _dict_or_empty(item.get("spec"))
+    container_statuses = _list_or_empty(status.get("containerStatuses"))
+    init_container_statuses = _list_or_empty(status.get("initContainerStatuses"))
+    normalized_statuses = [status for status in container_statuses if isinstance(status, dict)]
+    normalized_init_statuses = [status for status in init_container_statuses if isinstance(status, dict)]
+    return {
+        "podName": metadata.get("name"),
+        "phase": status.get("phase"),
+        "restartCount": _restart_count(normalized_statuses + normalized_init_statuses),
+        "nodeName": spec.get("nodeName"),
+        "ownerReferences": _list_or_empty(metadata.get("ownerReferences")),
+        "containerStatuses": [_container_status_summary(status) for status in normalized_statuses],
+        "initContainerStatuses": [_container_status_summary(status) for status in normalized_init_statuses],
+        "creationTimestamp": metadata.get("creationTimestamp"),
+        "startTime": status.get("startTime"),
+        "labels": _dict_or_empty(metadata.get("labels")),
+    }
+
+
+def _list_pods_payload(
+    namespace: str,
+    *,
+    label_selector: str | None,
+    field_selector: str | None,
+    phase: str | None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    field_parts = [part for part in [field_selector, f"status.phase={phase}" if phase else None] if part]
+    params: dict[str, object] = {}
+    if label_selector:
+        params["labelSelector"] = label_selector
+    if field_parts:
+        params["fieldSelector"] = ",".join(field_parts)
+    payload = _kubernetes_json_request(
+        "GET",
+        f"/api/v1/namespaces/{namespace}/pods",
+        params=params,
+        action="listing pods",
+    )
+    items = payload.get("items", [])
+    if not isinstance(items, list):
+        raise HTTPException(status_code=502, detail={"message": "Kubernetes pod list response was invalid."})
+    pods = [item for item in items if isinstance(item, dict)]
+    if phase:
+        pods = [pod for pod in pods if pod.get("status", {}).get("phase") == phase]
+    return pods, params.get("fieldSelector") if isinstance(params.get("fieldSelector"), str) else None
+
+
+def _label_selector_from_workload_selector(selector: dict[str, Any]) -> str:
+    parts: list[str] = []
+    match_labels = selector.get("matchLabels", {})
+    if isinstance(match_labels, dict):
+        parts.extend(f"{key}={value}" for key, value in sorted(match_labels.items()))
+
+    match_expressions = selector.get("matchExpressions", [])
+    if isinstance(match_expressions, list):
+        for expression in match_expressions:
+            if not isinstance(expression, dict):
+                continue
+            key = expression.get("key")
+            operator = expression.get("operator")
+            values = expression.get("values", [])
+            if not isinstance(key, str) or not isinstance(operator, str):
+                continue
+            if operator == "In" and isinstance(values, list):
+                parts.append(f"{key} in ({','.join(str(value) for value in values)})")
+            elif operator == "NotIn" and isinstance(values, list):
+                parts.append(f"{key} notin ({','.join(str(value) for value in values)})")
+            elif operator == "Exists":
+                parts.append(key)
+            elif operator == "DoesNotExist":
+                parts.append(f"!{key}")
+
+    if not parts:
+        raise HTTPException(status_code=502, detail={"message": "Workload selector is empty or unsupported."})
+    return ",".join(parts)
+
+
+def _workload_payload(namespace: str, kind: str, name: str) -> dict[str, Any]:
+    resource = "deployments" if kind == "Deployment" else "statefulsets"
+    return _kubernetes_json_request(
+        "GET",
+        f"/apis/apps/v1/namespaces/{namespace}/{resource}/{name}",
+        action=f"reading {kind.lower()} status",
+    )
+
+
+def _pods_for_workload(namespace: str, kind: str, name: str) -> tuple[list[dict[str, Any]], str]:
+    workload = _workload_payload(namespace, kind, name)
+    spec = _dict_or_empty(workload.get("spec"))
+    selector = _dict_or_empty(spec.get("selector"))
+    label_selector = _label_selector_from_workload_selector(selector)
+    pods, _ = _list_pods_payload(namespace, label_selector=label_selector, field_selector=None, phase=None)
+    return pods, label_selector
+
+
+def _pod_sort_key(pod: dict[str, Any]) -> tuple[str, str]:
+    metadata = _dict_or_empty(pod.get("metadata"))
+    status = _dict_or_empty(pod.get("status"))
+    timestamp = metadata.get("creationTimestamp") or status.get("startTime") or ""
+    name = metadata.get("name") or ""
+    return str(timestamp), str(name)
+
+
+def _select_latest_pod(pods: list[dict[str, Any]]) -> dict[str, Any]:
+    if not pods:
+        raise HTTPException(status_code=404, detail={"message": "No pods matched the requested selector."})
+    return max(pods, key=_pod_sort_key)
+
+
+def _event_summary(event: dict[str, Any]) -> dict[str, Any]:
+    metadata = _dict_or_empty(event.get("metadata"))
+    return {
+        "name": metadata.get("name"),
+        "type": event.get("type"),
+        "reason": event.get("reason"),
+        "message": event.get("message"),
+        "count": event.get("count"),
+        "firstTimestamp": event.get("firstTimestamp"),
+        "lastTimestamp": event.get("lastTimestamp"),
+        "eventTime": event.get("eventTime"),
+        "involvedObject": _dict_or_empty(event.get("involvedObject")),
+    }
+
+
+def _list_events_payload(
+    namespace: str,
+    *,
+    involved_object_kind: str | None,
+    involved_object_name: str | None,
+    involved_object_uid: str | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    field_parts = []
+    if involved_object_kind:
+        field_parts.append(f"involvedObject.kind={involved_object_kind}")
+    if involved_object_name:
+        field_parts.append(f"involvedObject.name={involved_object_name}")
+    if involved_object_uid:
+        field_parts.append(f"involvedObject.uid={involved_object_uid}")
+    params: dict[str, object] = {}
+    if field_parts:
+        params["fieldSelector"] = ",".join(field_parts)
+    payload = _kubernetes_json_request(
+        "GET",
+        f"/api/v1/namespaces/{namespace}/events",
+        params=params,
+        action="listing events",
+    )
+    items = payload.get("items", [])
+    if not isinstance(items, list):
+        raise HTTPException(status_code=502, detail={"message": "Kubernetes event list response was invalid."})
+    return [item for item in items if isinstance(item, dict)], params.get("fieldSelector") if isinstance(params.get("fieldSelector"), str) else None
+
+
+def _workload_status_summary(namespace: str, kind: str, name: str) -> dict[str, Any]:
+    payload = _workload_payload(namespace, kind, name)
+    spec = _dict_or_empty(payload.get("spec"))
+    status = _dict_or_empty(payload.get("status"))
+    events, _ = _list_events_payload(
+        namespace,
+        involved_object_kind=kind,
+        involved_object_name=name,
+    )
+    return {
+        "ok": True,
+        "namespace": namespace,
+        "kind": kind,
+        "name": name,
+        "desiredReplicas": spec.get("replicas", 1),
+        "readyReplicas": status.get("readyReplicas", 0),
+        "availableReplicas": status.get("availableReplicas", 0),
+        "updatedReplicas": status.get("updatedReplicas", 0),
+        "currentReplicas": status.get("currentReplicas"),
+        "observedGeneration": status.get("observedGeneration"),
+        "conditions": [condition for condition in _list_or_empty(status.get("conditions")) if isinstance(condition, dict)],
+        "events": [_event_summary(event) for event in events],
+    }
+
+
+def _build_pod_logs_response(
+    namespace: str,
+    pod: str,
+    *,
+    selection: dict[str, Any] | None,
+    container: str | None,
+    previous: bool,
+    tail_lines: int | None,
+    since_seconds: int | None,
+    limit_bytes: int | None,
+    timestamps: bool,
+) -> "PodLogsResponse":
+    source = "kubernetes-api"
+    try:
+        logs = _read_kubernetes_pod_logs(
+            namespace,
+            pod,
+            container,
+            previous,
+            tail_lines,
+            since_seconds,
+            limit_bytes,
+            timestamps,
+        )
+    except HTTPException as kubernetes_error:
+        try:
+            logs = _read_local_pod_logs(namespace, pod, container, previous)
+            source = "local-node-log-file"
+        except FileNotFoundError:
+            raise kubernetes_error
+
+    logs, redacted, truncated = _finalize_log_text(logs, tail_lines=tail_lines, limit_bytes=limit_bytes)
+    return PodLogsResponse(
+        ok=True,
+        source=source,
+        namespace=namespace,
+        pod=pod,
+        resolvedPodName=pod,
+        selection=selection,
+        container=container,
+        previous=previous,
+        tailLines=tail_lines,
+        sinceSeconds=since_seconds,
+        limitBytes=limit_bytes,
+        timestamps=timestamps,
+        redacted=redacted,
+        truncated=truncated,
+        logs=logs,
+    )
 
 
 def _generate_secret(spec: "GeneratedSecretSpec") -> str:
@@ -467,11 +786,71 @@ class PlatformSecretStatusResponse(BaseModel):
     missing: list[str]
 
 
+class PodSummary(BaseModel):
+    podName: str | None
+    phase: str | None
+    restartCount: int
+    nodeName: str | None
+    ownerReferences: list[dict[str, Any]]
+    containerStatuses: list[dict[str, Any]]
+    initContainerStatuses: list[dict[str, Any]]
+    creationTimestamp: str | None
+    startTime: str | None
+    labels: dict[str, Any]
+
+
+class PodListResponse(BaseModel):
+    ok: bool
+    namespace: str
+    labelSelector: str | None
+    fieldSelector: str | None
+    phase: str | None
+    count: int
+    pods: list[PodSummary]
+
+
+class KubernetesEventSummary(BaseModel):
+    name: str | None
+    type: str | None
+    reason: str | None
+    message: str | None
+    count: int | None
+    firstTimestamp: str | None
+    lastTimestamp: str | None
+    eventTime: str | None
+    involvedObject: dict[str, Any]
+
+
+class EventListResponse(BaseModel):
+    ok: bool
+    namespace: str
+    fieldSelector: str | None
+    count: int
+    events: list[KubernetesEventSummary]
+
+
+class WorkloadStatusResponse(BaseModel):
+    ok: bool
+    namespace: str
+    kind: str
+    name: str
+    desiredReplicas: int | None
+    readyReplicas: int | None
+    availableReplicas: int | None
+    updatedReplicas: int | None
+    currentReplicas: int | None = None
+    observedGeneration: int | None
+    conditions: list[dict[str, Any]]
+    events: list[KubernetesEventSummary]
+
+
 class PodLogsResponse(BaseModel):
     ok: bool
     source: str
     namespace: str
     pod: str
+    resolvedPodName: str
+    selection: dict[str, Any] | None = None
     container: str | None
     previous: bool
     tailLines: int | None
@@ -481,6 +860,16 @@ class PodLogsResponse(BaseModel):
     redacted: bool
     truncated: bool
     logs: str
+
+
+class ArgoCDApplicationResponse(BaseModel):
+    ok: bool
+    name: str
+    namespace: str
+    sync: dict[str, Any]
+    health: dict[str, Any]
+    operationState: dict[str, Any] | None
+    revision: str | None
 
 
 @app.get("/healthz", tags=["system"])
@@ -505,7 +894,11 @@ def capabilities() -> dict[str, object]:
         },
         "podLogs": {
             "enabled": True,
-            "endpointPattern": "GET /v1/kubernetes/namespaces/<namespace>/pods/<pod>/logs",
+            "endpointPatterns": [
+                "GET /v1/kubernetes/namespaces/<namespace>/pods/<pod>/logs",
+                "GET /v1/kubernetes/namespaces/<namespace>/deployments/<name>/logs",
+                "GET /v1/kubernetes/namespaces/<namespace>/pods/logs?labelSelector=<selector>",
+            ],
             "namespacePolicy": {
                 "mode": "non-system-namespaces-only",
                 "deniedPrefixes": list(LOG_QUERY_DENIED_NAMESPACE_PREFIXES),
@@ -521,6 +914,29 @@ def capabilities() -> dict[str, object]:
                 "enabled": True,
                 "mode": "best-effort-pattern-redaction",
             },
+            "selection": {
+                "latestPodBy": "metadata.creationTimestamp",
+                "returnsResolvedPodName": True,
+            },
+        },
+        "kubernetesDiscovery": {
+            "enabled": True,
+            "endpoints": [
+                "GET /v1/kubernetes/namespaces/<namespace>/pods",
+                "GET /v1/kubernetes/namespaces/<namespace>/deployments/<name>",
+                "GET /v1/kubernetes/namespaces/<namespace>/statefulsets/<name>",
+                "GET /v1/kubernetes/namespaces/<namespace>/deployments/<name>/pods",
+                "GET /v1/kubernetes/namespaces/<namespace>/events",
+            ],
+            "namespacePolicy": {
+                "mode": "non-system-namespaces-only",
+                "deniedPrefixes": list(LOG_QUERY_DENIED_NAMESPACE_PREFIXES),
+            },
+        },
+        "argocdApplications": {
+            "enabled": True,
+            "endpointPattern": "GET /v1/argocd/applications/<name>",
+            "namespace": ARGOCD_APPLICATION_NAMESPACE,
         },
         "platformSecretSource": {
             "enabled": bool(os.getenv("VAULT_ADDR")),
@@ -559,6 +975,205 @@ def platform_secret_status() -> PlatformSecretStatusResponse:
 
 
 @app.get(
+    "/v1/kubernetes/namespaces/{namespace}/pods",
+    response_model=PodListResponse,
+    tags=["kubernetes", "discovery"],
+)
+def list_pods(
+    namespace: Annotated[str, Path(pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")],
+    labelSelector: str | None = Query(default=None, min_length=1, max_length=512),
+    fieldSelector: str | None = Query(default=None, min_length=1, max_length=512),
+    phase: str | None = Query(default=None, pattern=r"^(Pending|Running|Succeeded|Failed|Unknown)$"),
+) -> PodListResponse:
+    _require_namespace_allowed_for_kubernetes_query(namespace)
+    pods, resolved_field_selector = _list_pods_payload(
+        namespace,
+        label_selector=labelSelector,
+        field_selector=fieldSelector,
+        phase=phase,
+    )
+    summaries = [_pod_summary(pod) for pod in pods]
+    return PodListResponse(
+        ok=True,
+        namespace=namespace,
+        labelSelector=labelSelector,
+        fieldSelector=resolved_field_selector,
+        phase=phase,
+        count=len(summaries),
+        pods=summaries,
+    )
+
+
+@app.get(
+    "/v1/kubernetes/namespaces/{namespace}/deployments/{name}",
+    response_model=WorkloadStatusResponse,
+    tags=["kubernetes", "workloads"],
+)
+def get_deployment_status(
+    namespace: Annotated[str, Path(pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")],
+    name: Annotated[str, Path(pattern=r"^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$")],
+) -> WorkloadStatusResponse:
+    _require_namespace_allowed_for_kubernetes_query(namespace)
+    return WorkloadStatusResponse(**_workload_status_summary(namespace, "Deployment", name))
+
+
+@app.get(
+    "/v1/kubernetes/namespaces/{namespace}/statefulsets/{name}",
+    response_model=WorkloadStatusResponse,
+    tags=["kubernetes", "workloads"],
+)
+def get_statefulset_status(
+    namespace: Annotated[str, Path(pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")],
+    name: Annotated[str, Path(pattern=r"^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$")],
+) -> WorkloadStatusResponse:
+    _require_namespace_allowed_for_kubernetes_query(namespace)
+    return WorkloadStatusResponse(**_workload_status_summary(namespace, "StatefulSet", name))
+
+
+@app.get(
+    "/v1/kubernetes/namespaces/{namespace}/deployments/{name}/pods",
+    response_model=PodListResponse,
+    tags=["kubernetes", "discovery"],
+)
+def list_deployment_pods(
+    namespace: Annotated[str, Path(pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")],
+    name: Annotated[str, Path(pattern=r"^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$")],
+    phase: str | None = Query(default=None, pattern=r"^(Pending|Running|Succeeded|Failed|Unknown)$"),
+) -> PodListResponse:
+    _require_namespace_allowed_for_kubernetes_query(namespace)
+    pods, label_selector = _pods_for_workload(namespace, "Deployment", name)
+    if phase:
+        pods = [pod for pod in pods if _dict_or_empty(pod.get("status")).get("phase") == phase]
+    summaries = [_pod_summary(pod) for pod in pods]
+    return PodListResponse(
+        ok=True,
+        namespace=namespace,
+        labelSelector=label_selector,
+        fieldSelector=f"status.phase={phase}" if phase else None,
+        phase=phase,
+        count=len(summaries),
+        pods=summaries,
+    )
+
+
+@app.get(
+    "/v1/kubernetes/namespaces/{namespace}/events",
+    response_model=EventListResponse,
+    tags=["kubernetes", "events"],
+)
+def list_events(
+    namespace: Annotated[str, Path(pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")],
+    involvedObjectKind: str | None = Query(default=None, pattern=r"^[A-Za-z][A-Za-z0-9]*$"),
+    involvedObjectName: str | None = Query(default=None, pattern=r"^[A-Za-z0-9]([-.A-Za-z0-9]*[A-Za-z0-9])?$"),
+    involvedObjectUid: str | None = Query(default=None, min_length=1, max_length=128),
+) -> EventListResponse:
+    _require_namespace_allowed_for_kubernetes_query(namespace)
+    events, field_selector = _list_events_payload(
+        namespace,
+        involved_object_kind=involvedObjectKind,
+        involved_object_name=involvedObjectName,
+        involved_object_uid=involvedObjectUid,
+    )
+    summaries = [_event_summary(event) for event in events]
+    return EventListResponse(
+        ok=True,
+        namespace=namespace,
+        fieldSelector=field_selector,
+        count=len(summaries),
+        events=summaries,
+    )
+
+
+@app.get(
+    "/v1/kubernetes/namespaces/{namespace}/pods/logs",
+    response_model=PodLogsResponse,
+    tags=["kubernetes", "logs"],
+)
+def get_latest_pod_logs_by_selector(
+    namespace: Annotated[str, Path(pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")],
+    labelSelector: str = Query(min_length=1, max_length=512),
+    phase: str | None = Query(default=None, pattern=r"^(Pending|Running|Succeeded|Failed|Unknown)$"),
+    container: str | None = Query(default=None, pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"),
+    previous: bool = Query(default=False),
+    tailLines: int | None = Query(default=LOG_QUERY_DEFAULT_TAIL_LINES, ge=1, le=LOG_QUERY_MAX_TAIL_LINES),
+    sinceSeconds: int | None = Query(default=None, ge=1, le=86400),
+    limitBytes: int | None = Query(default=LOG_QUERY_DEFAULT_LIMIT_BYTES, ge=1, le=LOG_QUERY_MAX_LIMIT_BYTES),
+    timestamps: bool = Query(default=False),
+) -> PodLogsResponse:
+    _require_namespace_allowed_for_kubernetes_query(namespace)
+    pods, field_selector = _list_pods_payload(
+        namespace,
+        label_selector=labelSelector,
+        field_selector=None,
+        phase=phase,
+    )
+    pod = _select_latest_pod(pods)
+    pod_name = _dict_or_empty(pod.get("metadata")).get("name")
+    if not isinstance(pod_name, str):
+        raise HTTPException(status_code=502, detail={"message": "Selected pod did not include a name."})
+    return _build_pod_logs_response(
+        namespace,
+        pod_name,
+        selection={
+            "mode": "labelSelector",
+            "labelSelector": labelSelector,
+            "fieldSelector": field_selector,
+            "phase": phase,
+            "matchedPods": len(pods),
+        },
+        container=container,
+        previous=previous,
+        tail_lines=tailLines,
+        since_seconds=sinceSeconds,
+        limit_bytes=limitBytes,
+        timestamps=timestamps,
+    )
+
+
+@app.get(
+    "/v1/kubernetes/namespaces/{namespace}/deployments/{name}/logs",
+    response_model=PodLogsResponse,
+    tags=["kubernetes", "logs"],
+)
+def get_latest_deployment_pod_logs(
+    namespace: Annotated[str, Path(pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")],
+    name: Annotated[str, Path(pattern=r"^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$")],
+    phase: str | None = Query(default=None, pattern=r"^(Pending|Running|Succeeded|Failed|Unknown)$"),
+    container: str | None = Query(default=None, pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"),
+    previous: bool = Query(default=False),
+    tailLines: int | None = Query(default=LOG_QUERY_DEFAULT_TAIL_LINES, ge=1, le=LOG_QUERY_MAX_TAIL_LINES),
+    sinceSeconds: int | None = Query(default=None, ge=1, le=86400),
+    limitBytes: int | None = Query(default=LOG_QUERY_DEFAULT_LIMIT_BYTES, ge=1, le=LOG_QUERY_MAX_LIMIT_BYTES),
+    timestamps: bool = Query(default=False),
+) -> PodLogsResponse:
+    _require_namespace_allowed_for_kubernetes_query(namespace)
+    pods, label_selector = _pods_for_workload(namespace, "Deployment", name)
+    if phase:
+        pods = [pod for pod in pods if _dict_or_empty(pod.get("status")).get("phase") == phase]
+    pod = _select_latest_pod(pods)
+    pod_name = _dict_or_empty(pod.get("metadata")).get("name")
+    if not isinstance(pod_name, str):
+        raise HTTPException(status_code=502, detail={"message": "Selected pod did not include a name."})
+    return _build_pod_logs_response(
+        namespace,
+        pod_name,
+        selection={
+            "mode": "deployment",
+            "deployment": name,
+            "labelSelector": label_selector,
+            "phase": phase,
+            "matchedPods": len(pods),
+        },
+        container=container,
+        previous=previous,
+        tail_lines=tailLines,
+        since_seconds=sinceSeconds,
+        limit_bytes=limitBytes,
+        timestamps=timestamps,
+    )
+
+
+@app.get(
     "/v1/kubernetes/namespaces/{namespace}/pods/{pod}/logs",
     response_model=PodLogsResponse,
     tags=["kubernetes", "logs"],
@@ -573,46 +1188,48 @@ def get_pod_logs(
     limitBytes: int | None = Query(default=LOG_QUERY_DEFAULT_LIMIT_BYTES, ge=1, le=LOG_QUERY_MAX_LIMIT_BYTES),
     timestamps: bool = Query(default=False),
 ) -> PodLogsResponse:
-    if not _namespace_allowed_for_log_query(namespace):
-        raise HTTPException(
-            status_code=403,
-            detail="Log queries are limited to non-system application namespaces.",
-        )
-
-    source = "kubernetes-api"
-    try:
-        logs = _read_kubernetes_pod_logs(
-            namespace,
-            pod,
-            container,
-            previous,
-            tailLines,
-            sinceSeconds,
-            limitBytes,
-            timestamps,
-        )
-    except HTTPException as kubernetes_error:
-        try:
-            logs = _read_local_pod_logs(namespace, pod, container, previous)
-            source = "local-node-log-file"
-        except FileNotFoundError:
-            raise kubernetes_error
-
-    logs, redacted, truncated = _finalize_log_text(logs, tail_lines=tailLines, limit_bytes=limitBytes)
-    return PodLogsResponse(
-        ok=True,
-        source=source,
-        namespace=namespace,
-        pod=pod,
+    _require_namespace_allowed_for_kubernetes_query(namespace)
+    return _build_pod_logs_response(
+        namespace,
+        pod,
+        selection={"mode": "pod", "pod": pod},
         container=container,
         previous=previous,
-        tailLines=tailLines,
-        sinceSeconds=sinceSeconds,
-        limitBytes=limitBytes,
+        tail_lines=tailLines,
+        since_seconds=sinceSeconds,
+        limit_bytes=limitBytes,
         timestamps=timestamps,
-        redacted=redacted,
-        truncated=truncated,
-        logs=logs,
+    )
+
+
+@app.get(
+    "/v1/argocd/applications/{name}",
+    response_model=ArgoCDApplicationResponse,
+    tags=["argocd"],
+)
+def get_argocd_application(
+    name: Annotated[str, Path(pattern=r"^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$")],
+) -> ArgoCDApplicationResponse:
+    payload = _kubernetes_json_request(
+        "GET",
+        f"/apis/argoproj.io/v1alpha1/namespaces/{ARGOCD_APPLICATION_NAMESPACE}/applications/{name}",
+        action="reading ArgoCD application status",
+    )
+    status = _dict_or_empty(payload.get("status"))
+    sync = _dict_or_empty(status.get("sync"))
+    health = _dict_or_empty(status.get("health"))
+    operation_state = status.get("operationState") if isinstance(status.get("operationState"), dict) else None
+    revision = sync.get("revision")
+    if not isinstance(revision, str):
+        revision = None
+    return ArgoCDApplicationResponse(
+        ok=True,
+        name=name,
+        namespace=ARGOCD_APPLICATION_NAMESPACE,
+        sync=sync,
+        health=health,
+        operationState=operation_state,
+        revision=revision,
     )
 
 
