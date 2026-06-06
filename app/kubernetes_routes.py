@@ -13,11 +13,9 @@ from .kubernetes_diagnostics import (
     LOG_QUERY_MAX_TAIL_LINES,
     ArgoCDApplicationResponse,
     EventListResponse,
-    JobListResponse,
     PodListResponse,
     PodDetailResponse,
     PodLogsResponse,
-    RunCorrelationResponse,
     WorkloadStatusResponse,
     _build_pod_logs_response,
     _dict_or_empty,
@@ -25,14 +23,12 @@ from .kubernetes_diagnostics import (
     _kubernetes_json_request,
     _list_events_payload,
     _list_pods_payload,
-    _job_list_response,
     _pod_detail_response,
     _pods_for_workload,
     _pod_summary,
     _require_namespace_allowed_for_kubernetes_query,
     _select_latest_pod,
     _workload_detail_response,
-    _run_correlation_response,
 )
 
 
@@ -83,31 +79,6 @@ def get_statefulset_status(
     return WorkloadStatusResponse(**_workload_detail_response(namespace, "StatefulSet", name))
 
 
-@router.get("/v1/kubernetes/namespaces/{namespace}/jobs", response_model=JobListResponse, tags=["kubernetes", "jobs"])
-def list_jobs(
-    namespace: Annotated[str, Path(pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")],
-) -> JobListResponse:
-    _require_namespace_allowed_for_kubernetes_query(namespace)
-    return JobListResponse(**_job_list_response(namespace))
-
-
-@router.get("/v1/kubernetes/namespaces/{namespace}/jobs/{name}", response_model=WorkloadStatusResponse, tags=["kubernetes", "jobs"])
-def get_job_status(
-    namespace: Annotated[str, Path(pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")],
-    name: Annotated[str, Path(pattern=r"^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$")],
-    pendingTimeoutSeconds: int | None = Query(default=None, ge=1, le=86400),
-    terminatingTimeoutSeconds: int | None = Query(default=None, ge=1, le=86400),
-) -> WorkloadStatusResponse:
-    _require_namespace_allowed_for_kubernetes_query(namespace)
-    return WorkloadStatusResponse(**_workload_detail_response(
-        namespace,
-        "Job",
-        name,
-        pending_timeout_seconds=pendingTimeoutSeconds,
-        terminating_timeout_seconds=terminatingTimeoutSeconds,
-    ))
-
-
 @router.get("/v1/kubernetes/namespaces/{namespace}/deployments/{name}/pods", response_model=PodListResponse, tags=["kubernetes", "discovery"])
 def list_deployment_pods(
     namespace: Annotated[str, Path(pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")],
@@ -128,15 +99,6 @@ def list_deployment_pods(
         count=len(summaries),
         pods=summaries,
     )
-
-
-@router.get("/v1/kubernetes/namespaces/{namespace}/dagster/runs/{runId}", response_model=RunCorrelationResponse, tags=["kubernetes", "dagster"])
-def get_run_correlation(
-    namespace: Annotated[str, Path(pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")],
-    runId: Annotated[str, Path(min_length=1, max_length=128)],
-) -> RunCorrelationResponse:
-    _require_namespace_allowed_for_kubernetes_query(namespace)
-    return RunCorrelationResponse(**_run_correlation_response(namespace, runId))
 
 
 @router.get("/v1/kubernetes/namespaces/{namespace}/events", response_model=EventListResponse, tags=["kubernetes", "events"])

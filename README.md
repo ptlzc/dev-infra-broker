@@ -75,7 +75,7 @@ The response contains only key names.
 
 All namespace-scoped Kubernetes diagnostics are limited to non-system application namespaces. The broker returns summarized status only and never returns Kubernetes Secret values.
 
-### Pod Discovery
+### Core Observability
 
 Endpoint:
 
@@ -96,6 +96,17 @@ Deployment pod shortcut:
 ```text
 GET /v1/kubernetes/namespaces/{namespace}/deployments/{name}/pods
 ```
+
+Also included in this domain:
+
+- `GET /v1/kubernetes/namespaces/{namespace}/pods/{pod}`
+- `GET /v1/kubernetes/namespaces/{namespace}/deployments/{name}`
+- `GET /v1/kubernetes/namespaces/{namespace}/statefulsets/{name}`
+- `GET /v1/kubernetes/namespaces/{namespace}/events`
+- `GET /v1/kubernetes/namespaces/{namespace}/pods/{pod}/logs`
+- `GET /v1/kubernetes/namespaces/{namespace}/deployments/{name}/logs`
+- `GET /v1/kubernetes/namespaces/{namespace}/pods/logs?labelSelector={selector}`
+- `GET /v1/argocd/applications/{name}`
 
 ### Workload Status
 
@@ -134,7 +145,7 @@ GET /v1/kubernetes/namespaces/{namespace}/pods/{pod}
 
 Returns a `kubectl describe pod` style summary including owner chain, container state, resource requests/limits, recent events, and a failure summary.
 
-### Jobs
+### Workload Intelligence
 
 Endpoints:
 
@@ -154,6 +165,16 @@ GET /v1/kubernetes/namespaces/{namespace}/dagster/runs/{runId}
 ```
 
 Returns matched Jobs and Pods for a Dagster run id, including restart and failure summaries plus current and previous log links.
+
+### Capabilities
+
+`/v1/capabilities` is grouped by capability domain:
+
+- `platform-secret`
+- `core-observability`
+- `workload-intelligence`
+
+Each group lists its interface surface and the permission preconditions it expects from the caller's ServiceAccount.
 
 ### Pod Log Query
 
