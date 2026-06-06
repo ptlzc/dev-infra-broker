@@ -124,6 +124,37 @@ Supported query parameters:
 
 Use this for scheduler, image pull, and restart-loop diagnosis.
 
+### Pod Details
+
+Endpoint:
+
+```text
+GET /v1/kubernetes/namespaces/{namespace}/pods/{pod}
+```
+
+Returns a `kubectl describe pod` style summary including owner chain, container state, resource requests/limits, recent events, and a failure summary.
+
+### Jobs
+
+Endpoints:
+
+```text
+GET /v1/kubernetes/namespaces/{namespace}/jobs
+GET /v1/kubernetes/namespaces/{namespace}/jobs/{name}
+```
+
+Job detail includes matched Pods, selected Pod summary, diagnostic links, and failure summary.
+
+### Dagster Run Correlation
+
+Endpoint:
+
+```text
+GET /v1/kubernetes/namespaces/{namespace}/dagster/runs/{runId}
+```
+
+Returns matched Jobs and Pods for a Dagster run id, including restart and failure summaries plus current and previous log links.
+
 ### Pod Log Query
 
 Endpoint:
@@ -149,6 +180,7 @@ GET /v1/kubernetes/namespaces/{namespace}/pods/logs?labelSelector={selector}
 ```
 
 These responses include `resolvedPodName` and a `selection` object showing how the pod was selected. The broker returns a bounded snapshot only. Log queries are redacted with best-effort pattern masking and do not support streaming follow mode.
+When `previous=true` is requested and previous logs are unavailable, the response includes `previousAvailable=false` and `previousUnavailableReason`.
 
 ## ArgoCD Application Status
 
