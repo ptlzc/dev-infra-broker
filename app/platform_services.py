@@ -79,6 +79,20 @@ class PlatformSecretStatusResponse(BaseModel):
     missing: list[str]
 
 
+class ProjectSecretReadRequest(BaseModel):
+    namespace: str = Field(pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+    serviceAccountName: str = Field(pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+    keys: list[str] = Field(min_length=1)
+
+
+class ProjectSecretReadResponse(BaseModel):
+    ok: bool
+    namespace: str
+    serviceAccountName: str
+    secrets: dict[str, str]
+    missing: list[str]
+
+
 def _vault_settings() -> tuple[str, str, str]:
     address = os.getenv("VAULT_ADDR", "").rstrip("/")
     mount = os.getenv("VAULT_KV_MOUNT", "k3s-kv").strip("/")

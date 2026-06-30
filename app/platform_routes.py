@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Path
+import os
+
+from fastapi import APIRouter, Header, HTTPException, Path
 
 from .platform_services import (
     GITHUB_ACTIONS_SYNC_KEYS,
@@ -8,6 +10,8 @@ from .platform_services import (
     GitHubActionsSecretSyncRequest,
     GitHubActionsSecretSyncResponse,
     PlatformSecretStatusResponse,
+    ProjectSecretReadRequest,
+    ProjectSecretReadResponse,
     RuntimeSecretEnsureRequest,
     RuntimeSecretEnsureResponse,
     _encrypt_github_secret,
@@ -22,6 +26,17 @@ from .platform_services import (
 
 
 router = APIRouter()
+
+
+def _verify_reader_token(authorization: str | None) -> None:
+    expected = os.getenv("PROJECT_SECRET_READER_TOKEN", "").strip()
+    if not expected:
+        raise HTTPException(status_code=503, detail="Project secret reader token is not configured.")
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
+    token = authorization[len("Bearer "):].strip()
+    if token != expected:
+        raise HTTPException(status_code=403, detail="Invalid project secret reader token.")
 
 
 @router.get(
@@ -149,4 +164,46 @@ def sync_github_actions_secrets(
         repository=f"{owner}/{repo}",
         synced=synced,
         missing=[],
+    )
+
+
+@router.post(
+    "/v1/project-secrets/read",
+    response_model=ProjectSecretReadResponse,
+    tags=["project-secrets"],
+)
+def read_project_secrets(
+    request: ProjectSecretReadRequest,
+    authorization: str | None = Header(default=None),
+) -> ProjectSecretReadResponse:
+    _verify_reader_token(authorization)
+    _, mount, _ = _vault_settings()
+    path = f"projects/{request.namespace}/{request.serviceAccountName}/env"
+    data = _read_vault_kv2_secret(mount, path)
+
+    requested_keys = list(dict.fromkeys(request.keys))
+    secrets: dict[str, str] = {}
+    missing: list[str] = []
+    for key in requested_keys:
+        if not key.replace("_", "").isalnum() or not key or key[0].isdigit():
+            raise HTTPException(status_code=400, detail=f"Invalid secret key: {key}")
+        value = data.get(key)
+        if value is not None and value != "":
+            secrets[key] = str(value)
+        else:
+            missing.append(key)
+
+    print(
+        f"[audit] project-secrets/read namespace={request.namespace} "
+        f"serviceAccount={request.serviceAccountName} keys={requested_keys} "
+        f"returned={list(secrets.keys())} missing={missing}",
+        flush=True,
+    )
+
+    return ProjectSecretReadResponse(
+        ok=not missing,
+        namespace=request.namespace,
+        serviceAccountName=request.serviceAccountName,
+        secrets=secrets,
+        missing=missing,
     )

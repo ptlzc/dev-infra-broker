@@ -42,6 +42,18 @@ def capabilities_payload() -> dict[str, object]:
                 ],
             },
             {
+                "name": "project-secret-reader",
+                "description": "Bearer-token-authenticated read access for external applications to retrieve specific keys from project runtime secrets.",
+                "interfaces": [
+                    "POST /v1/project-secrets/read",
+                ],
+                "permissions": [
+                    "Vault KV read for projects/<namespace>/<serviceAccountName>/env",
+                    "Requires Bearer token (PROJECT_SECRET_READER_TOKEN env var)",
+                    "Returns only requested keys; audit-logged to stdout",
+                ],
+            },
+            {
                 "name": "core-observability",
                 "description": "Read-only Kubernetes and ArgoCD observability for pods, workloads, logs, events, and applications.",
                 "interfaces": [
